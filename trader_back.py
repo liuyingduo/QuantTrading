@@ -13,7 +13,9 @@ plt.rcParams['axes.prop_cycle'] = plt.cycler(
     color=['red', 'green', 'blue', 'cyan', 'magenta', 'yellow', 'black', 'purple', 'pink', 'brown', 'orange', 'teal'])
 
 # 利用 AKShare 获取股票的后复权数据，这里只获取前 7 列
-stock_hfq_df = ak.stock_zh_a_hist(symbol="002630", adjust="hfq").iloc[:, :7]
+stock_hfq_df = ak.stock_zh_a_hist(symbol="600300", adjust="qfq").iloc[:, :7]
+# 保存为excel
+stock_hfq_df.to_excel("600300_qfq.xlsx")
 # 删除 `股票代码` 列
 del stock_hfq_df['股票代码']
 # 处理字段命名，以符合 Backtrader 的要求
@@ -25,6 +27,7 @@ stock_hfq_df.columns = [
     'low',
     'volume',
 ]
+
 # 把 date 作为日期索引，以符合 Backtrader 的要求
 stock_hfq_df.index = pd.to_datetime(stock_hfq_df['date'])
 
@@ -171,17 +174,40 @@ class AdvancedStrategy(bt.Strategy):
             
         if order.status in [order.Completed]:
             if order.isbuy():
-                self.log(f'买入执行, 价格: {order.executed.price:.2f}, 成本: {order.executed.value:.2f}, 手续费: {order.executed.comm:.2f}')
+                self.current_position = order.executed.size
+                self.log(f'买入执行 [{self.buy_signal_type}], 价格: {order.executed.price:.2f}, 数量: {order.executed.size}, 成本: {order.executed.value:.2f}, 手续费: {order.executed.comm:.2f}')
                 self.buy_price = order.executed.price
                 # 设置ATR止损
                 self.stop_loss = self.buy_price - self.params.atr_multiplier * self.atr[0]
-                self.in_trade = True
+                # 设置止盈目标
+                if self.buy_signal_type == "均线聚合":
+                    self.profit_target = self.buy_price * (1 + self.params.ma_convergence_profit_take)
+                    self.log(f'均线聚合策略 - 设置更高止盈目标: {self.profit_target:.2f} (收益率: {self.params.ma_convergence_profit_take*100:.1f}%)')
+                else:
+                    self.profit_target = self.buy_price * (1 + self.params.profit_take)
+                # 重置持仓天数和最高价
+                self.holding_days = 0
+                self.highest_price = self.buy_price
+                self.profit_locked = False
+                # 打印账户信息
+                self.log(f'账户信息 - 现金: {self.broker.getcash():.2f}, 持仓市值: {self.broker.getvalue() - self.broker.getcash():.2f}, 总资产: {self.broker.getvalue():.2f}')
             else:
-                self.log(f'卖出执行, 价格: {order.executed.price:.2f}, 成本: {order.executed.value:.2f}, 手续费: {order.executed.comm:.2f}')
-                if order.executed.price > self.buy_price:
+                sell_price = order.executed.price
+                sell_size = order.executed.size
+                profit_loss = (sell_price - self.buy_price) * sell_size
+                profit_loss_pct = (sell_price / self.buy_price - 1) * 100 if self.buy_price else 0
+                
+                self.log(f'卖出执行, 价格: {sell_price:.2f}, 数量: {sell_size}, 收入: {order.executed.value:.2f}, 手续费: {order.executed.comm:.2f}')
+                self.log(f'交易结果 - 盈亏: {profit_loss:.2f} ({profit_loss_pct:.2f}%), 持仓时间: {self.holding_days}天, 最高价比例: {(self.highest_price/self.buy_price-1)*100:.2f}%')
+                
+                if sell_price > self.buy_price:
                     self.profitable_trades += 1
                 self.trade_count += 1
-                self.in_trade = False
+                self.last_sell_date = self.datas[0].datetime.date(0)
+                self.current_position = 0
+                
+                # 打印账户信息
+                self.log(f'账户信息 - 现金: {self.broker.getcash():.2f}, 持仓市值: {self.broker.getvalue() - self.broker.getcash():.2f}, 总资产: {self.broker.getvalue():.2f}')
                 
         elif order.status in [order.Canceled, order.Margin, order.Rejected]:
             self.log('订单取消/保证金不足/拒绝')
@@ -259,13 +285,26 @@ class HighReturnStrategy(bt.Strategy):
         ("rsi_oversold", 30),     # RSI超卖阈值
         ("rsi_overbought", 60),   # RSI超买阈值（降低以更早识别顶部）
         ("volume_ratio", 1.5),    # 成交量放大比例
-        ("profit_take", 0.12),    # 止盈比例（降低以更容易触发止盈）
+        ("profit_take", 0.20),    # 提高止盈目标到20%
         ("min_holding_days", 2),  # 最小持仓天数（降低以更快获利了结）
         ("max_holding_days", 15), # 最大持仓天数（避免长期持有）
         ("trailing_stop", True),  # 启用追踪止损
         ("trailing_percent", 0.05), # 追踪止损百分比（降低以更积极保护利润）
-        ("profit_lock_threshold", 0.08), # 利润锁定阈值（当利润达到8%时启动更激进的追踪止损）
-        ("profit_lock_trailing", 0.03),  # 利润锁定追踪比例（3%）
+        ("profit_lock_threshold", 0.15),  # 提高利润锁定阈值到15%
+        ("profit_lock_trailing", 0.02),   # 降低利润锁定追踪比例到2%
+        ("ma_convergence_threshold", 0.01),  # 均线聚合阈值，均线之间的距离小于此值视为聚合
+        ("ma_convergence_profit_take", 0.25),  # 均线聚合策略的止盈目标
+        ("ma_convergence_max_holding_days", 25),  # 均线聚合策略的最大持仓天数
+        ("rapid_rise_days", 3),    # 快速上涨天数
+        ("rapid_rise_threshold", 0.08),  # 快速上涨阈值，3天内上涨8%以上
+        ("volume_spike_ratio", 2.0),  # 成交量放大比例，用于识别成交量异常放大
+        ("target_point_rise_days", 5),  # 目标点上涨天数
+        ("target_point_rise_threshold", 0.15),  # 目标点上涨阈值，5天内上涨15%以上
+        ("target_point_volume_ratio", 2.5),  # 目标点成交量放大比例
+        ("target_point_rsi_threshold", 75),  # 目标点RSI阈值
+        ("enable_target_point_sell", True),  # 是否启用目标点卖出
+        ("only_target_point_sell", True),  # 是否只在目标点卖出（禁用其他卖出条件）
+        ("target_point_min_profit", 8.0),  # 目标点卖出的最小利润要求（百分比）
     )
 
     def __init__(self):
@@ -371,6 +410,11 @@ class HighReturnStrategy(bt.Strategy):
         self.consecutive_lower_highs = 0   # 连续更低高点计数
         self.prev_close = 0
         self.prev_high = 0
+        
+        # 目标点识别
+        self.price_history = []  # 记录价格历史
+        self.volume_history = []  # 记录成交量历史
+        self.rsi_history = []  # 记录RSI历史
 
     def log(self, txt, dt=None):
         """记录日志"""
@@ -390,7 +434,11 @@ class HighReturnStrategy(bt.Strategy):
                 # 设置ATR止损
                 self.stop_loss = self.buy_price - self.params.atr_multiplier * self.atr[0]
                 # 设置止盈目标
-                self.profit_target = self.buy_price * (1 + self.params.profit_take)
+                if self.buy_signal_type == "均线聚合":
+                    self.profit_target = self.buy_price * (1 + self.params.ma_convergence_profit_take)
+                    self.log(f'均线聚合策略 - 设置更高止盈目标: {self.profit_target:.2f} (收益率: {self.params.ma_convergence_profit_take*100:.1f}%)')
+                else:
+                    self.profit_target = self.buy_price * (1 + self.params.profit_take)
                 # 重置持仓天数和最高价
                 self.holding_days = 0
                 self.highest_price = self.buy_price
@@ -484,6 +532,113 @@ class HighReturnStrategy(bt.Strategy):
         
         return potential_top
 
+    def detect_target_point(self):
+        """
+        专门检测图中指出的那一点（快速上涨后的高点）
+        """
+        # 确保有足够的历史数据
+        if len(self.data_close) < self.params.target_point_rise_days + 5:
+            return False
+            
+        # 更新历史数据
+        self.price_history.append(self.data_close[0])
+        self.volume_history.append(self.data_volume[0])
+        self.rsi_history.append(self.rsi[0])
+        
+        # 保持历史数据长度适中
+        if len(self.price_history) > 30:
+            self.price_history.pop(0)
+            self.volume_history.pop(0)
+            self.rsi_history.pop(0)
+            
+        # 如果历史数据不足，无法判断
+        if len(self.price_history) < self.params.target_point_rise_days + 5:
+            return False
+            
+        # 1. 检查是否有快速上涨
+        recent_prices = self.price_history[-self.params.target_point_rise_days:]
+        start_price = recent_prices[0]
+        end_price = recent_prices[-1]
+        rise_pct = (end_price / start_price - 1) * 100
+        
+        is_rapid_rise = rise_pct > self.params.target_point_rise_threshold * 100
+        
+        # 2. 检查上涨形态 - 连续上涨且最后一天涨幅较大
+        price_trend = all(recent_prices[i] >= recent_prices[i-1] * 1.005 for i in range(1, len(recent_prices)))
+        last_day_rise = (recent_prices[-1] / recent_prices[-2] - 1) > 0.02  # 最后一天涨幅超过2%
+        
+        # 3. 检查成交量 - 成交量逐渐放大，最后一天成交量显著放大
+        recent_volumes = self.volume_history[-self.params.target_point_rise_days:]
+        volume_trend = all(recent_volumes[i] >= recent_volumes[i-1] * 0.9 for i in range(1, len(recent_volumes)))
+        last_day_volume_spike = recent_volumes[-1] > self.volume_ma[0] * self.params.target_point_volume_ratio
+        
+        # 4. 检查RSI - RSI处于高位且接近超买
+        recent_rsi = self.rsi_history[-1]
+        rsi_high = recent_rsi > self.params.target_point_rsi_threshold
+        
+        # 5. 检查MACD - MACD柱状图在高位但开始减弱
+        macd_hist_weakening = False
+        if len(self.macd_hist) > 2:
+            macd_hist_weakening = (self.macd_hist[0] > 0 and 
+                                  self.macd_hist[0] < self.macd_hist[-1] and 
+                                  self.macd_hist[-1] < self.macd_hist[-2])
+        
+        # 6. 检查价格与均线关系 - 价格远离均线（过度扩张）
+        price_overextended = self.data_close[0] > self.sma5[0] * 1.08
+        
+        # 7. 检查K线形态 - 最后一根K线为长上影线或十字星
+        last_candle_high_shadow = False
+        if len(self.data_high) > 0 and len(self.data_low) > 0 and len(self.data_open) > 0 and len(self.data_close) > 0:
+            candle_body = abs(self.data_close[0] - self.data_open[0])
+            upper_shadow = self.data_high[0] - max(self.data_close[0], self.data_open[0])
+            lower_shadow = min(self.data_close[0], self.data_open[0]) - self.data_low[0]
+            
+            # 上影线较长或十字星
+            last_candle_high_shadow = (upper_shadow > candle_body * 1.5) or (candle_body < (self.data_high[0] - self.data_low[0]) * 0.2)
+        
+        # 8. 检查均线关系 - 三条均线开始聚合或交叉
+        ma_converging = False
+        if len(self.sma5) > 5 and len(self.sma10) > 5 and len(self.sma20) > 5:
+            # 计算当前均线距离
+            current_ma5_ma10_dist = abs(self.sma5[0] - self.sma10[0]) / self.sma5[0]
+            current_ma10_ma20_dist = abs(self.sma10[0] - self.sma20[0]) / self.sma10[0]
+            
+            # 计算5天前均线距离
+            prev_ma5_ma10_dist = abs(self.sma5[-5] - self.sma10[-5]) / self.sma5[-5]
+            prev_ma10_ma20_dist = abs(self.sma10[-5] - self.sma20[-5]) / self.sma10[-5]
+            
+            # 均线距离缩小，表示均线正在聚合
+            ma_converging = (current_ma5_ma10_dist < prev_ma5_ma10_dist * 0.8 or
+                            current_ma10_ma20_dist < prev_ma10_ma20_dist * 0.8)
+        
+        # 9. 检查是否与图中指出的点特征匹配
+        # 图中的点特征：快速上涨后，成交量放大，RSI高位，价格远离均线，K线形态特殊
+        target_point_match = (
+            is_rapid_rise and 
+            last_day_volume_spike and
+            rsi_high and
+            price_overextended and
+            (last_candle_high_shadow or macd_hist_weakening)
+        )
+        
+        # 综合判断
+        target_point_detected = (
+            is_rapid_rise and 
+            (price_trend or last_day_rise) and
+            (volume_trend or last_day_volume_spike) and
+            rsi_high and
+            (macd_hist_weakening or price_overextended or last_candle_high_shadow) and
+            (target_point_match or ma_converging)  # 增加与目标点特征匹配的要求
+        )
+        
+        if target_point_detected:
+            self.log(f'目标点检测 - 涨幅: {rise_pct:.2f}%, 价格趋势: {price_trend}, 最后一天涨幅: {last_day_rise}, '
+                    f'成交量趋势: {volume_trend}, 成交量放大: {last_day_volume_spike}, RSI: {recent_rsi:.2f}, '
+                    f'MACD减弱: {macd_hist_weakening}, 价格过度扩张: {price_overextended}, K线形态: {last_candle_high_shadow}, '
+                    f'均线聚合: {ma_converging}, 目标点匹配: {target_point_match}')
+            
+        return target_point_detected
+
     def next(self):
         """策略逻辑"""
         if self.order:
@@ -548,8 +703,42 @@ class HighReturnStrategy(bt.Strategy):
                 self.trend != 'down'  # 不在下跌趋势中
             )
             
+            # 3. 均线聚合买入 - 适合三条均线接近且趋势向上的情况
+            # 计算均线之间的距离
+            ma5_ma10_distance = abs(self.sma5[0] - self.sma10[0]) / self.sma5[0]
+            ma10_ma20_distance = abs(self.sma10[0] - self.sma20[0]) / self.sma10[0]
+            
+            # 均线聚合条件：三条均线之间的距离都小于设定阈值
+            ma_convergence = ma5_ma10_distance < self.params.ma_convergence_threshold and ma10_ma20_distance < self.params.ma_convergence_threshold
+            
+            # 价格站上所有均线
+            price_above_mas = self.data_close[0] > self.sma5[0] and self.data_close[0] > self.sma10[0] and self.data_close[0] > self.sma20[0]
+            
+            # 均线方向向上
+            ma_direction_up = self.sma5_slope[0] > 0 and self.sma10_slope[0] > 0
+            
+            # MACD柱状图为正或向上
+            macd_positive_or_rising = False
+            if len(self.macd_hist) > 1:
+                macd_positive_or_rising = self.macd_hist[0] > 0 or (self.macd_hist[0] > self.macd_hist[-1])
+            
+            # 均线聚合买入信号
+            ma_convergence_signal = (
+                ma_convergence and 
+                price_above_mas and 
+                ma_direction_up and 
+                macd_positive_or_rising and
+                self.trend != 'down'
+            )
+            
+            # 如果满足均线聚合条件，记录日志
+            if ma_convergence:
+                self.log(f'均线聚合检测 - 距离: MA5-MA10={ma5_ma10_distance:.4f}, MA10-MA20={ma10_ma20_distance:.4f}, 阈值={self.params.ma_convergence_threshold:.4f}')
+                if ma_convergence_signal:
+                    self.log(f'均线聚合买入信号 - 价格站上均线: {price_above_mas}, 均线向上: {ma_direction_up}, MACD状态: {macd_positive_or_rising}, 趋势: {self.trend}')
+            
             # 综合买入信号
-            buy_signal = breakout_signal or dip_buy_signal
+            buy_signal = breakout_signal or dip_buy_signal or ma_convergence_signal
             
             if buy_signal:
                 # 确定买入信号类型
@@ -557,6 +746,8 @@ class HighReturnStrategy(bt.Strategy):
                     self.buy_signal_type = "强势突破"
                 elif dip_buy_signal:
                     self.buy_signal_type = "低吸回调"
+                elif ma_convergence_signal:
+                    self.buy_signal_type = "均线聚合"
                 
                 # 全仓买入
                 cash = self.broker.getcash()
@@ -631,28 +822,95 @@ class HighReturnStrategy(bt.Strategy):
             # 8. 利润锁定后出现任何回调
             profit_lock_pullback = False
             if self.profit_locked and len(self.data_close) > 1:
-                profit_lock_pullback = self.data_close[0] < self.data_close[-1]
+                # 只有回调超过3%才卖出
+                profit_lock_pullback = self.data_close[0] < self.data_close[-1] * 0.97
+            
+            # 9. 快速上涨后的高点卖出 - 针对图中指出的那一点
+            rapid_rise_sell = False
+            if len(self.data_close) > self.params.rapid_rise_days:
+                # 计算最近几天的涨幅
+                recent_rise_pct = (self.data_close[0] / self.data_close[-self.params.rapid_rise_days] - 1) * 100
+                
+                # 检查是否有快速上涨
+                is_rapid_rise = recent_rise_pct > self.params.rapid_rise_threshold * 100
+                
+                # 检查成交量是否放大
+                volume_spike = self.data_volume[0] > self.volume_ma[0] * self.params.volume_spike_ratio
+                
+                # 检查价格是否创新高
+                new_high = self.data_close[0] >= max([self.data_close[-i] for i in range(1, 10) if i < len(self.data_close)])
+                
+                # 检查RSI是否在高位
+                rsi_high = self.rsi[0] > 70
+                
+                # 综合判断
+                rapid_rise_sell = (
+                    is_rapid_rise and 
+                    (volume_spike or new_high) and 
+                    rsi_high and
+                    current_profit_pct > 10  # 确保有足够的利润
+                )
+                
+                if rapid_rise_sell:
+                    self.log(f'检测到快速上涨高点 - 涨幅: {recent_rise_pct:.2f}%, 成交量放大: {volume_spike}, 新高: {new_high}, RSI: {self.rsi[0]:.2f}')
+            
+            # 10. 目标点卖出 - 专门针对图中指出的那一点
+            target_point_sell = False
+            if self.params.enable_target_point_sell:
+                target_point_sell = self.detect_target_point() and current_profit_pct > self.params.target_point_min_profit
+                
+                if target_point_sell:
+                    self.log(f'目标点卖出信号触发 - 当前利润: {current_profit_pct:.2f}%')
             
             # 最小持仓天数检查
             min_holding_days_met = self.holding_days >= self.params.min_holding_days
             
-            # 卖出信号：止损不受最小持仓天数限制，其他卖出条件需要满足最小持仓天数
-            sell_signal = stop_loss_triggered or (
-                min_holding_days_met and (
-                    take_profit_triggered or 
-                    macd_death_cross or 
-                    price_ma_breakdown or 
-                    holding_too_long or 
-                    significant_pullback or
-                    (potential_top and current_profit_pct > 5) or  # 只有在有利润的情况下才考虑顶部形态
-                    profit_lock_pullback
+            # 如果设置了只在目标点卖出，则忽略其他卖出条件
+            if self.params.only_target_point_sell:
+                sell_signal = stop_loss_triggered or target_point_sell  # 只保留止损和目标点卖出
+            else:
+                # 卖出信号：止损不受最小持仓天数限制，其他卖出条件需要满足最小持仓天数
+                sell_signal = stop_loss_triggered or target_point_sell or (
+                    min_holding_days_met and (
+                        take_profit_triggered or 
+                        macd_death_cross or 
+                        price_ma_breakdown or 
+                        holding_too_long or 
+                        significant_pullback or
+                        (potential_top and current_profit_pct > 5) or  # 只有在有利润的情况下才考虑顶部形态
+                        profit_lock_pullback or
+                        rapid_rise_sell  # 添加新的卖出条件
+                    )
                 )
-            )
+            
+            # 如果是均线聚合买入的情况，使用更宽松的卖出条件
+            if self.buy_signal_type == "均线聚合" and not self.params.only_target_point_sell:
+                # 1. 延长最小持仓时间
+                min_holding_days_met = self.holding_days >= self.params.min_holding_days * 2
+                
+                # 2. 使用专门的止盈目标
+                take_profit_triggered = self.data_close[0] >= self.buy_price * (1 + self.params.ma_convergence_profit_take)
+                
+                # 3. 使用专门的最大持仓天数
+                holding_too_long = self.holding_days >= self.params.ma_convergence_max_holding_days
+                
+                # 4. 只有在明确的顶部形态或大幅回撤时才卖出
+                sell_signal = stop_loss_triggered or target_point_sell or (
+                    min_holding_days_met and (
+                        take_profit_triggered or  # 使用更高的止盈目标
+                        (potential_top and current_profit_pct > 10) or  # 提高顶部形态的利润要求
+                        (significant_pullback and self.highest_price > self.buy_price * 1.15) or  # 提高回撤的利润要求
+                        holding_too_long or  # 使用更长的最大持仓时间
+                        rapid_rise_sell  # 对于均线聚合策略也添加快速上涨高点卖出条件
+                    )
+                )
             
             if sell_signal:
                 sell_reason = ""
                 if stop_loss_triggered:
                     sell_reason = "止损"
+                elif target_point_sell:
+                    sell_reason = "目标点卖出"
                 elif take_profit_triggered:
                     sell_reason = "止盈目标达成"
                 elif potential_top and current_profit_pct > 5:
@@ -667,6 +925,8 @@ class HighReturnStrategy(bt.Strategy):
                     sell_reason = "从高点大幅回落"
                 elif profit_lock_pullback:
                     sell_reason = "利润锁定后回调"
+                elif rapid_rise_sell:
+                    sell_reason = "快速上涨后高点"
                 
                 self.log(f'卖出信号触发 - 原因: {sell_reason}, 当前价: {self.data_close[0]:.2f}, 买入价: {self.buy_price:.2f}, 最高价: {self.highest_price:.2f}, 盈亏: {current_profit_pct:.2f}%')
                 self.order = self.sell(size=self.current_position)  # 全仓卖出
