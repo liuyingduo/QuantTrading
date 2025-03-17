@@ -13,7 +13,7 @@ plt.rcParams['axes.prop_cycle'] = plt.cycler(
     color=['red', 'green', 'blue', 'cyan', 'magenta', 'yellow', 'black', 'purple', 'pink', 'brown', 'orange', 'teal'])
 
 # 利用 AKShare 获取股票的后复权数据，这里只获取前 7 列
-stock_hfq_df = ak.stock_zh_a_hist(symbol="600163", adjust="hfq").iloc[:, :7]
+stock_hfq_df = ak.stock_zh_a_hist(symbol="002630", adjust="hfq").iloc[:, :7]
 # 删除 `股票代码` 列
 del stock_hfq_df['股票代码']
 # 处理字段命名，以符合 Backtrader 的要求
@@ -240,10 +240,10 @@ class AdvancedStrategy(bt.Strategy):
         self.log(f'策略结束 - 总交易次数: {self.trade_count}, 盈利交易: {self.profitable_trades}, 胜率: {win_rate:.2f}%')
 
 
-class BalancedStrategy(bt.Strategy):
+class HighReturnStrategy(bt.Strategy):
     """
-    精英策略：专注于高胜率、高收益的交易机会
-    采用精简的买入卖出条件，减少交易频率，提高单笔收益
+    高收益策略：专注于捕捉高点卖出和低点买入，追求最大收益率
+    采用更激进的买卖条件，提前识别顶部和底部，实现高收益交易
     """
     params = (
         ("sma5", 5),        # 短期均线
@@ -257,10 +257,15 @@ class BalancedStrategy(bt.Strategy):
         ("atr_multiplier", 3.0),  # ATR乘数，用于止损
         ("rsi_period", 14),       # RSI周期
         ("rsi_oversold", 30),     # RSI超卖阈值
-        ("rsi_overbought", 70),   # RSI超买阈值
+        ("rsi_overbought", 60),   # RSI超买阈值（降低以更早识别顶部）
         ("volume_ratio", 1.5),    # 成交量放大比例
-        ("profit_take", 0.20),    # 止盈比例（20%）
-        ("min_holding_days", 5),  # 最小持仓天数
+        ("profit_take", 0.12),    # 止盈比例（降低以更容易触发止盈）
+        ("min_holding_days", 2),  # 最小持仓天数（降低以更快获利了结）
+        ("max_holding_days", 15), # 最大持仓天数（避免长期持有）
+        ("trailing_stop", True),  # 启用追踪止损
+        ("trailing_percent", 0.05), # 追踪止损百分比（降低以更积极保护利润）
+        ("profit_lock_threshold", 0.08), # 利润锁定阈值（当利润达到8%时启动更激进的追踪止损）
+        ("profit_lock_trailing", 0.03),  # 利润锁定追踪比例（3%）
     )
 
     def __init__(self):
@@ -278,6 +283,8 @@ class BalancedStrategy(bt.Strategy):
         self.profit_target = None
         self.buy_signal_type = None  # 记录买入信号类型
         self.holding_days = 0        # 持仓天数
+        self.highest_price = 0       # 持仓期间最高价格（用于追踪止损）
+        self.profit_locked = False   # 是否已锁定部分利润
         
         # 均线指标 - 三线系统
         self.sma5 = bt.indicators.SimpleMovingAverage(
@@ -299,7 +306,6 @@ class BalancedStrategy(bt.Strategy):
         self.sma5_slope = bt.indicators.ROC(self.sma5, period=1)
         self.sma10_slope = bt.indicators.ROC(self.sma10, period=1)
         self.sma20_slope = bt.indicators.ROC(self.sma20, period=1)
-        self.sma60_slope = bt.indicators.ROC(self.sma60, period=1)
         
         # MACD指标 - 用于确认动量
         self.macd = bt.indicators.MACD(
@@ -342,22 +348,29 @@ class BalancedStrategy(bt.Strategy):
             devfactor=2.0
         )
         
+        # 价格动量 - 用于判断价格加速度变化
+        self.momentum = bt.indicators.Momentum(
+            self.data_close, period=5
+        )
+        
         # 记录交易状态
         self.trade_count = 0
         self.profitable_trades = 0
         self.last_sell_date = None
-        self.cooldown_period = 3  # 增加卖出后的冷却期（天数）
+        self.cooldown_period = 2  # 减少卖出后的冷却期（天数）
         
         # 记录账户信息
         self.initial_cash = self.broker.getcash()
         self.current_position = 0
         
         # 趋势状态
-        self.trend = None  # 'up', 'down', 'sideways'
-        self.trend_changed_date = None
+        self.trend = 'unknown'  # 'up', 'down', 'sideways'
         
-        # 市场状态评分
-        self.market_score = 0  # 市场状态评分，用于判断买入时机
+        # 高点识别
+        self.consecutive_lower_closes = 0  # 连续收盘价下跌计数
+        self.consecutive_lower_highs = 0   # 连续更低高点计数
+        self.prev_close = 0
+        self.prev_high = 0
 
     def log(self, txt, dt=None):
         """记录日志"""
@@ -378,8 +391,10 @@ class BalancedStrategy(bt.Strategy):
                 self.stop_loss = self.buy_price - self.params.atr_multiplier * self.atr[0]
                 # 设置止盈目标
                 self.profit_target = self.buy_price * (1 + self.params.profit_take)
-                # 重置持仓天数
+                # 重置持仓天数和最高价
                 self.holding_days = 0
+                self.highest_price = self.buy_price
+                self.profit_locked = False
                 # 打印账户信息
                 self.log(f'账户信息 - 现金: {self.broker.getcash():.2f}, 持仓市值: {self.broker.getvalue() - self.broker.getcash():.2f}, 总资产: {self.broker.getvalue():.2f}')
             else:
@@ -389,7 +404,7 @@ class BalancedStrategy(bt.Strategy):
                 profit_loss_pct = (sell_price / self.buy_price - 1) * 100 if self.buy_price else 0
                 
                 self.log(f'卖出执行, 价格: {sell_price:.2f}, 数量: {sell_size}, 收入: {order.executed.value:.2f}, 手续费: {order.executed.comm:.2f}')
-                self.log(f'交易结果 - 盈亏: {profit_loss:.2f} ({profit_loss_pct:.2f}%), 持仓时间: {self.holding_days}天')
+                self.log(f'交易结果 - 盈亏: {profit_loss:.2f} ({profit_loss_pct:.2f}%), 持仓时间: {self.holding_days}天, 最高价比例: {(self.highest_price/self.buy_price-1)*100:.2f}%')
                 
                 if sell_price > self.buy_price:
                     self.profitable_trades += 1
@@ -407,73 +422,67 @@ class BalancedStrategy(bt.Strategy):
 
     def update_trend(self):
         """更新当前市场趋势状态"""
-        # 判断长期趋势
-        long_term_trend_up = self.sma20[0] > self.sma60[0] and self.sma60_slope[0] > 0
-        long_term_trend_down = self.sma20[0] < self.sma60[0] and self.sma60_slope[0] < 0
-        
         # 判断中短期趋势
-        short_term_trend_up = self.sma5[0] > self.sma10[0] and self.sma10[0] > self.sma20[0]
-        short_term_trend_down = self.sma5[0] < self.sma10[0] and self.sma10[0] < self.sma20[0]
-        
-        # 判断均线斜率
-        slopes_up = self.sma5_slope[0] > 0 and self.sma10_slope[0] > 0 and self.sma20_slope[0] > 0
-        slopes_down = self.sma5_slope[0] < 0 and self.sma10_slope[0] < 0 and self.sma20_slope[0] < 0
-        
-        # 综合判断趋势
-        prev_trend = self.trend
-        
-        if (long_term_trend_up and short_term_trend_up) or (short_term_trend_up and slopes_up):
-            self.trend = 'up'
-        elif (long_term_trend_down and short_term_trend_down) or (short_term_trend_down and slopes_down):
-            self.trend = 'down'
+        if self.sma5[0] > self.sma10[0] > self.sma20[0]:
+            if self.sma5_slope[0] > 0 and self.sma10_slope[0] > 0:
+                self.trend = 'up'
+            else:
+                self.trend = 'sideways'
+        elif self.sma5[0] < self.sma10[0] < self.sma20[0]:
+            if self.sma5_slope[0] < 0 and self.sma10_slope[0] < 0:
+                self.trend = 'down'
+            else:
+                self.trend = 'sideways'
         else:
             self.trend = 'sideways'
             
-        # 记录趋势变化
-        if prev_trend != self.trend:
-            self.trend_changed_date = self.datas[0].datetime.date(0)
-            self.log(f'趋势变化: {prev_trend} -> {self.trend}')
-            
-    def calculate_market_score(self):
-        """计算市场状态评分，用于判断买入时机"""
-        score = 0
+    def detect_potential_top(self):
+        """检测潜在的顶部形态"""
+        # 更新连续下跌计数
+        if len(self.data_close) > 1 and self.prev_close > 0:
+            if self.data_close[0] < self.prev_close:
+                self.consecutive_lower_closes += 1
+            else:
+                self.consecutive_lower_closes = 0
+        self.prev_close = self.data_close[0]
         
-        # 趋势评分 (0-40分)
-        if self.trend == 'up':
-            score += 40
-        elif self.trend == 'sideways':
-            score += 20
+        # 更新连续更低高点计数
+        if len(self.data_high) > 1 and self.prev_high > 0:
+            if self.data_high[0] < self.prev_high:
+                self.consecutive_lower_highs += 1
+            else:
+                self.consecutive_lower_highs = 0
+        self.prev_high = self.data_high[0]
         
-        # 均线排列评分 (0-20分)
-        if self.sma5[0] > self.sma10[0] > self.sma20[0]:
-            score += 20
-        elif self.sma5[0] > self.sma10[0]:
-            score += 10
-            
-        # MACD评分 (0-15分)
-        if self.macd.macd[0] > self.macd.signal[0] and self.macd_hist[0] > 0:
-            score += 15
-        elif self.macd.macd[0] > self.macd.signal[0]:
-            score += 10
-        elif self.macd_hist[0] > 0:
-            score += 5
-            
-        # RSI评分 (0-15分)
-        if 40 <= self.rsi[0] <= 60:  # 中性区域，上升空间大
-            score += 15
-        elif 30 <= self.rsi[0] < 40:  # 轻度超卖
-            score += 10
-        elif self.rsi[0] > 60:  # 接近超买
-            score += 5
-            
-        # 成交量评分 (0-10分)
-        if self.data_volume[0] > self.volume_ma[0] * self.params.volume_ratio:
-            score += 10
-        elif self.data_volume[0] > self.volume_ma[0]:
-            score += 5
-            
-        self.market_score = score
-        return score
+        # 1. 价格接近布林带上轨
+        near_upper_band = self.data_close[0] > self.bollinger.lines.top[0] * 0.95
+        
+        # 2. RSI进入超买区域
+        rsi_overbought = self.rsi[0] > self.params.rsi_overbought
+        
+        # 3. 价格动量减弱
+        momentum_weakening = False
+        if len(self.momentum) > 1:
+            momentum_weakening = self.momentum[0] < self.momentum[-1]
+        
+        # 4. MACD柱状图减弱
+        macd_weakening = False
+        if len(self.macd_hist) > 1:
+            macd_weakening = self.macd_hist[0] > 0 and self.macd_hist[0] < self.macd_hist[-1]
+        
+        # 5. 价格与短期均线距离过大（过度扩张）
+        price_overextended = self.data_close[0] > self.sma5[0] * 1.05
+        
+        # 综合判断
+        potential_top = (
+            (near_upper_band and rsi_overbought) or
+            (rsi_overbought and macd_weakening) or
+            (self.consecutive_lower_closes >= 2 and rsi_overbought) or
+            (self.consecutive_lower_highs >= 2 and momentum_weakening) or
+            (price_overextended and momentum_weakening)
+        )
+        
+        return potential_top
 
     def next(self):
         """策略逻辑"""
@@ -483,9 +492,6 @@ class BalancedStrategy(bt.Strategy):
         # 更新趋势状态
         self.update_trend()
         
-        # 计算市场评分
-        self.calculate_market_score()
-        
         # 检查是否持仓
         if not self.position:
             # 检查是否在卖出冷却期内
@@ -494,43 +500,63 @@ class BalancedStrategy(bt.Strategy):
                 if days_since_sell < self.cooldown_period:
                     return
             
-            # === 精英买入条件 ===
+            # 检测潜在顶部，避免买在高点
+            if self.detect_potential_top():
+                return  # 如果检测到潜在顶部，不买入
             
-            # 1. 市场评分必须达到高分（至少70分）
-            high_market_score = self.market_score >= 70
+            # === 买入条件 ===
             
-            # 2. 三线黄金排列 - 经典的强势上涨形态
-            golden_cross = self.sma5[0] > self.sma10[0] > self.sma20[0] > self.sma60[0]
+            # 1. 强势突破买入 - 适合上升趋势
+            # 三线黄金排列 + 均线同向上涨 + 价格站上所有均线 + (MACD金叉或成交量确认)
+            golden_cross = self.sma5[0] > self.sma10[0] > self.sma20[0]
+            all_ma_rising = (self.sma5_slope[0] > 0 and self.sma10_slope[0] > 0 and self.sma20_slope[0] > 0)
+            price_above_all_ma = (self.data_close[0] > self.sma5[0] and self.data_close[0] > self.sma10[0])
             
-            # 3. 均线同向上涨 - 确认趋势强度
-            all_ma_rising = (self.sma5_slope[0] > 0 and 
-                            self.sma10_slope[0] > 0 and 
-                            self.sma20_slope[0] > 0)
+            # 确保有足够的数据点
+            macd_golden_cross = False
+            if len(self.macd.macd) > 1 and len(self.macd.signal) > 1:
+                macd_golden_cross = (self.macd.macd[0] > self.macd.signal[0] and 
+                                    self.macd.macd[-1] <= self.macd.signal[-1])
             
-            # 4. 价格站上所有均线 - 确认价格强势
-            price_above_all_ma = (self.data_close[0] > self.sma5[0] and 
-                                 self.data_close[0] > self.sma10[0] and 
-                                 self.data_close[0] > self.sma20[0])
-            
-            # 5. MACD金叉确认 - 动量指标确认
-            macd_golden_cross = (self.macd.macd[0] > self.macd.signal[0] and 
-                                self.macd.macd[-1] <= self.macd.signal[-1])
-            
-            # 6. 成交量确认 - 放量突破更可靠
             volume_confirm = self.data_volume[0] > self.volume_ma[0] * self.params.volume_ratio
             
-            # 强势突破买入信号：市场评分高 + 三线黄金排列 + 均线同向上涨 + 价格站上所有均线 + (MACD金叉或成交量确认)
-            breakout_signal = (high_market_score and 
-                              golden_cross and 
+            breakout_signal = (golden_cross and 
                               all_ma_rising and 
                               price_above_all_ma and 
                               (macd_golden_cross or volume_confirm))
             
-            # 买入信号
-            buy_signal = breakout_signal
+            # 2. 低吸买入 - 适合回调买入
+            # RSI超卖 + 价格接近布林带下轨 + 价格企稳
+            rsi_oversold = self.rsi[0] < self.params.rsi_oversold
+            near_lower_band = self.data_close[0] < self.bollinger.lines.bot[0] * 1.05
+            
+            price_stabilizing = False
+            if len(self.data_close) > 1 and len(self.data_open) > 1:
+                price_stabilizing = (self.data_close[0] > self.data_open[0] and 
+                                    self.data_close[-1] > self.data_open[-1])
+            
+            # 价格反弹确认 - 连续两天收阳
+            price_bounce = False
+            if len(self.data_close) > 2 and len(self.data_open) > 2:
+                price_bounce = (self.data_close[0] > self.data_open[0] and 
+                               self.data_close[-1] > self.data_open[-1] and
+                               self.data_close[0] > self.data_close[-1])
+            
+            dip_buy_signal = (
+                (rsi_oversold or near_lower_band) and 
+                (price_stabilizing or price_bounce) and
+                self.trend != 'down'  # 不在下跌趋势中
+            )
+            
+            # 综合买入信号
+            buy_signal = breakout_signal or dip_buy_signal
             
             if buy_signal:
-                self.buy_signal_type = "强势突破"
+                # 确定买入信号类型
+                if breakout_signal:
+                    self.buy_signal_type = "强势突破"
+                elif dip_buy_signal:
+                    self.buy_signal_type = "低吸回调"
                 
                 # 全仓买入
                 cash = self.broker.getcash()
@@ -538,53 +564,111 @@ class BalancedStrategy(bt.Strategy):
                 size = int(cash * 0.99 / price)  # 预留1%现金应对手续费
                 
                 if size > 0:
-                    self.log(f'买入信号触发 - 类型: {self.buy_signal_type}, 价格: {price:.2f}, 数量: {size}, 总金额: {price * size:.2f}, 市场评分: {self.market_score}')
+                    self.log(f'买入信号触发 - 类型: {self.buy_signal_type}, 价格: {price:.2f}, 数量: {size}, 总金额: {price * size:.2f}')
                     self.order = self.buy(size=size)
                     self.last_buy_date = self.datas[0].datetime.date(0)
         else:
-            # 更新持仓天数
+            # 更新持仓天数和最高价
             self.holding_days += 1
+            if self.data_close[0] > self.highest_price:
+                self.highest_price = self.data_close[0]
             
             # 计算当前持仓盈亏百分比
             current_profit_pct = (self.data_close[0] / self.buy_price - 1) * 100
             
-            # === 精英卖出条件 ===
+            # 更新追踪止损价格
+            if self.params.trailing_stop and self.data_close[0] > self.buy_price:
+                # 根据利润水平选择不同的追踪止损比例
+                if current_profit_pct >= self.params.profit_lock_threshold and not self.profit_locked:
+                    # 当利润达到阈值时，启用更激进的追踪止损
+                    self.profit_locked = True
+                    self.log(f'利润锁定机制激活 - 当前利润: {current_profit_pct:.2f}%, 追踪止损比例: {self.params.profit_lock_trailing * 100}%')
+                
+                # 选择追踪止损比例
+                trailing_percent = self.params.profit_lock_trailing if self.profit_locked else self.params.trailing_percent
+                
+                # 计算新的追踪止损价格
+                trailing_stop_price = self.highest_price * (1 - trailing_percent)
+                
+                # 如果新的追踪止损价格高于当前止损价格，则更新止损价格
+                if trailing_stop_price > self.stop_loss:
+                    self.stop_loss = trailing_stop_price
             
-            # 1. 止损：价格低于ATR止损线（保留核心止损机制）
+            # === 卖出条件 ===
+            
+            # 1. 止损：价格低于止损线
             stop_loss_triggered = self.data_close[0] < self.stop_loss
             
-            # 2. 止盈：价格达到止盈目标（20%收益）
+            # 2. 止盈：价格达到止盈目标
             take_profit_triggered = self.data_close[0] >= self.profit_target
             
-            # 3. 趋势明确转为下跌
-            trend_turned_down = (self.trend == 'down' and 
-                                self.trend_changed_date == self.datas[0].datetime.date(0) and 
-                                self.sma5[0] < self.sma10[0])
+            # 3. 检测潜在顶部
+            potential_top = self.detect_potential_top()
             
-            # 4. 顶部反转信号：MACD死叉 + 价格跌破5日均线 + RSI从高位回落
-            top_reversal = (self.macd.macd[0] < self.macd.signal[0] and 
-                           self.macd.macd[-1] >= self.macd.signal[-1] and 
-                           self.data_close[0] < self.sma5[0] and 
-                           self.rsi[0] < self.rsi[-1] and self.rsi[-1] > 65)
+            # 4. MACD死叉：MACD线下穿信号线（在高位区域）
+            macd_death_cross = False
+            if (len(self.macd.macd) > 1 and len(self.macd.signal) > 1 and 
+                len(self.rsi) > 0):
+                macd_death_cross = (self.macd.macd[0] < self.macd.signal[0] and 
+                                   self.macd.macd[-1] >= self.macd.signal[-1] and 
+                                   self.rsi[0] > 55)
+            
+            # 5. 价格跌破短期均线 + RSI高位回落
+            price_ma_breakdown = False
+            if len(self.data_close) > 1 and len(self.sma5) > 1 and len(self.rsi) > 1:
+                price_ma_breakdown = (self.data_close[0] < self.sma5[0] and 
+                                     self.data_close[-1] >= self.sma5[-1] and 
+                                     self.rsi[0] < self.rsi[-1] and 
+                                     self.rsi[-1] > 55)
+            
+            # 6. 持仓时间过长
+            holding_too_long = self.holding_days >= self.params.max_holding_days
+            
+            # 7. 从高点大幅回落
+            significant_pullback = (self.data_close[0] < self.highest_price * 0.95 and 
+                                   self.highest_price > self.buy_price * 1.08)  # 降低回撤触发阈值
+            
+            # 8. 利润锁定后出现任何回调
+            profit_lock_pullback = False
+            if self.profit_locked and len(self.data_close) > 1:
+                profit_lock_pullback = self.data_close[0] < self.data_close[-1]
             
             # 最小持仓天数检查
             min_holding_days_met = self.holding_days >= self.params.min_holding_days
             
             # 卖出信号：止损不受最小持仓天数限制，其他卖出条件需要满足最小持仓天数
-            sell_signal = stop_loss_triggered or (min_holding_days_met and (take_profit_triggered or trend_turned_down or top_reversal))
+            sell_signal = stop_loss_triggered or (
+                min_holding_days_met and (
+                    take_profit_triggered or 
+                    macd_death_cross or 
+                    price_ma_breakdown or 
+                    holding_too_long or 
+                    significant_pullback or
+                    (potential_top and current_profit_pct > 5) or  # 只有在有利润的情况下才考虑顶部形态
+                    profit_lock_pullback
+                )
+            )
             
             if sell_signal:
                 sell_reason = ""
                 if stop_loss_triggered:
                     sell_reason = "止损"
                 elif take_profit_triggered:
-                    sell_reason = "止盈"
-                elif trend_turned_down:
-                    sell_reason = "趋势转为下跌"
-                elif top_reversal:
-                    sell_reason = "顶部反转"
+                    sell_reason = "止盈目标达成"
+                elif potential_top and current_profit_pct > 5:
+                    sell_reason = "顶部形态确认"
+                elif macd_death_cross:
+                    sell_reason = "MACD死叉"
+                elif price_ma_breakdown:
+                    sell_reason = "价格跌破短期均线"
+                elif holding_too_long:
+                    sell_reason = "持仓时间过长"
+                elif significant_pullback:
+                    sell_reason = "从高点大幅回落"
+                elif profit_lock_pullback:
+                    sell_reason = "利润锁定后回调"
                 
-                self.log(f'卖出信号触发 - 原因: {sell_reason}, 当前价: {self.data_close[0]:.2f}, 买入价: {self.buy_price:.2f}, 盈亏: {current_profit_pct:.2f}%, 持仓天数: {self.holding_days}')
+                self.log(f'卖出信号触发 - 原因: {sell_reason}, 当前价: {self.data_close[0]:.2f}, 买入价: {self.buy_price:.2f}, 最高价: {self.highest_price:.2f}, 盈亏: {current_profit_pct:.2f}%')
                 self.order = self.sell(size=self.current_position)  # 全仓卖出
                 
     def stop(self):
@@ -603,7 +687,7 @@ cerebro.adddata(data)  # 将数据传入回测系统
 # 选择使用哪个策略
 # cerebro.addstrategy(MyStrategy)  # 简单均线交叉策略
 # cerebro.addstrategy(AdvancedStrategy)  # 高级多指标策略
-cerebro.addstrategy(BalancedStrategy)  # 平衡策略
+cerebro.addstrategy(HighReturnStrategy)  # 高收益策略
 
 start_cash = 1000000
 cerebro.broker.setcash(start_cash)  # 设置初始资本为 100000
