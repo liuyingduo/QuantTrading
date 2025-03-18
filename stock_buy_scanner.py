@@ -19,7 +19,7 @@ class BuySignalAnalyzer:
     买入信号分析器：分析股票是否触发买入信号
     基于HighReturnStrategy的买入策略
     """
-    def __init__(self, stock_code, stock_name=None, data_days=120):
+    def __init__(self, stock_code, stock_name=None, data_days=120, include_today=True):
         """
         初始化分析器
         
@@ -27,10 +27,12 @@ class BuySignalAnalyzer:
         stock_code: 股票代码
         stock_name: 股票名称（可选）
         data_days: 获取的历史数据天数
+        include_today: 是否包含今天的数据
         """
         self.stock_code = stock_code
         self.stock_name = stock_name if stock_name else stock_code
         self.data_days = data_days
+        self.include_today = include_today
         self.data = None
         self.buy_signals = []
         self.score = 0  # 综合得分
@@ -47,7 +49,7 @@ class BuySignalAnalyzer:
             "rsi_period": 14,
             "rsi_oversold": 30,
             "volume_ratio": 1.5,
-            "ma_convergence_threshold": 0.01,
+            "ma_convergence_threshold": 0.005,
             # 新增指标参数
             "kdj_period": 9,
             "kdj_signal_period": 3,
@@ -88,6 +90,15 @@ class BuySignalAnalyzer:
             
             # 转换日期列为日期类型
             stock_df['date'] = pd.to_datetime(stock_df['date'])
+            
+            # 如果不包含今天的数据，则排除最后一行
+            if not self.include_today:
+                today = pd.Timestamp.now().normalize()
+                # 检查是否有今天的数据
+                has_today = (stock_df['date'].max() == today)
+                if has_today:
+                    print(f"根据设置，排除今天({today.strftime('%Y-%m-%d')})的数据")
+                    stock_df = stock_df[stock_df['date'] < today]
             
             # 只保留最近N天的数据
             if len(stock_df) > self.data_days:
@@ -545,7 +556,7 @@ class StockScanner:
     """
     股票扫描器：扫描股票列表，分析哪些股票触发了买入信号
     """
-    def __init__(self, stock_list=None, use_index=False, index_code="000300", top_n=300):
+    def __init__(self, stock_list=None, use_index=False, index_code="000300", top_n=300, new_account_only=False, include_today=True):
         """
         初始化扫描器
         
@@ -554,16 +565,84 @@ class StockScanner:
         use_index: 是否使用指数成分股
         index_code: 指数代码，默认为沪深300
         top_n: 使用指数成分股时，选取的股票数量
+        new_account_only: 是否只筛选新开户投资者可买的股票（00、000、002、60开头）
+        include_today: 是否包含今天的数据
         """
         self.stock_list = stock_list if stock_list else []
         self.use_index = use_index
         self.index_code = index_code
         self.top_n = top_n
+        self.new_account_only = new_account_only
+        self.include_today = include_today
         self.results = []
+        
+    def is_new_account_eligible(self, stock_code):
+        """
+        判断股票是否符合新开户投资者可买条件
+        
+        参数:
+        stock_code: 股票代码
+        
+        返回:
+        bool: 是否符合条件
+        """
+        if not stock_code:
+            return False
+            
+        # 去掉股票代码中可能的前缀（如sh.、sz.等）
+        code = stock_code.strip()
+        if '.' in code:
+            code = code.split('.')[-1]
+            
+        # 判断是否为新开户可买股票（00、000、002、60开头）
+        return (code.startswith('00') or 
+                code.startswith('000') or 
+                code.startswith('002') or 
+                code.startswith('60'))
+    
+    def load_new_account_stocks(self, limit=None):
+        """
+        直接加载所有新开户可买的股票
+        
+        参数:
+        limit: 限制加载的股票数量
+        
+        返回:
+        bool: 是否成功加载
+        """
+        try:
+            print("正在获取所有A股股票列表...")
+            # 获取A股股票列表
+            stock_list = ak.stock_zh_a_spot_em()
+            # 只保留股票代码和名称
+            stock_list = stock_list[['代码', '名称']].values.tolist()
+            
+            # 筛选出新开户可买的股票（00、000、002、60开头）
+            new_account_stocks = [stock for stock in stock_list 
+                                  if self.is_new_account_eligible(stock[0])]
+            
+            print(f"共找到 {len(new_account_stocks)} 只新开户可买股票")
+            
+            # 限制数量
+            if limit and len(new_account_stocks) > limit:
+                new_account_stocks = new_account_stocks[:limit]
+                print(f"已限制为前 {limit} 只股票")
+            
+            self.stock_list = new_account_stocks
+            return True
+        except Exception as e:
+            print(f"获取新开户可买股票失败: {e}")
+            import traceback
+            traceback.print_exc()
+            return False
         
     def load_stock_list(self):
         """加载股票列表"""
         if self.stock_list:
+            # 如果启用新开户筛选，筛选符合条件的股票
+            if self.new_account_only:
+                self.stock_list = [stock for stock in self.stock_list 
+                                   if self.is_new_account_eligible(stock[0])]
             return
             
         if self.use_index:
@@ -574,6 +653,12 @@ class StockScanner:
                     index_stocks = ak.index_stock_cons_weight_csindex(symbol="000300")
                     # 只保留股票代码和名称
                     index_stocks = index_stocks[['成分券代码', '成分券名称']].values.tolist()
+                    
+                    # 如果启用新开户筛选，筛选符合条件的股票
+                    if self.new_account_only:
+                        index_stocks = [stock for stock in index_stocks 
+                                        if self.is_new_account_eligible(stock[0])]
+                    
                     # 只保留前N个
                     self.stock_list = index_stocks[:self.top_n]
                 else:
@@ -589,6 +674,12 @@ class StockScanner:
                 stock_list = ak.stock_zh_a_spot_em()
                 # 只保留股票代码和名称
                 stock_list = stock_list[['代码', '名称']].values.tolist()
+                
+                # 如果启用新开户筛选，筛选符合条件的股票
+                if self.new_account_only:
+                    stock_list = [stock for stock in stock_list 
+                                  if self.is_new_account_eligible(stock[0])]
+                
                 # 只保留前N个
                 self.stock_list = stock_list[:self.top_n]
             except Exception as e:
@@ -599,7 +690,7 @@ class StockScanner:
         """分析单个股票"""
         try:
             code, name = stock
-            analyzer = BuySignalAnalyzer(code, name)
+            analyzer = BuySignalAnalyzer(code, name, include_today=self.include_today)
             result = analyzer.run_analysis()
             return result
         except Exception as e:
@@ -671,7 +762,12 @@ class StockScanner:
         if filename is None:
             # 使用当前日期作为文件名
             today = datetime.datetime.now().strftime("%Y%m%d")
-            filename = f"股票买入信号_{today}.xlsx"
+            filename = f"股票买入信号_{today}"
+            if self.new_account_only:
+                filename += "_新开户可买"
+            if not self.include_today:
+                filename += "_不含今日数据"
+            filename += ".xlsx"
         
         # 提取需要保存的字段
         data = []
@@ -858,7 +954,7 @@ class StockScanner:
         print("-" * 120)
         
         # 打印每只股票
-        row_format = "{:<10}{:<15}{:<8.1f}{:<10.2f}{:<10}{:<10}{:<10}{:<10}{:<10}{:<10}{:<10}{:<10}"
+        row_format = "{:<10}{:<15}{:<8.1f}{:<10.2f}{:<10}{:<10}{:<10}{:<10}{:<10}{:<10}{:<10}"
         for signal in buy_signals:
             print(row_format.format(
                 signal['股票代码'],
@@ -888,12 +984,16 @@ def main():
     print("1. 扫描沪深300成分股")
     print("2. 扫描自定义股票列表")
     print("3. 扫描单个股票")
+    print("4. 扫描所有新开户可买股票（00、000、002、60开头）")
     
     choice = input("请输入选择 (默认1): ").strip() or "1"
     
+    # 询问是否包含今天的数据
+    include_today = input("\n是否包含今天的数据进行计算？(y/n，默认y): ").strip().lower() != 'n'
+    
     if choice == "1":
         # 扫描沪深300成分股
-        scanner = StockScanner(use_index=True, index_code="000300", top_n=300)
+        scanner = StockScanner(use_index=True, index_code="000300", top_n=300, include_today=include_today)
         scanner.scan_stocks()
         scanner.print_buy_signals()
         scanner.save_results()
@@ -912,7 +1012,7 @@ def main():
             # 获取股票代码和名称
             stock_list = df.iloc[:, :2].values.tolist()
             
-            scanner = StockScanner(stock_list=stock_list)
+            scanner = StockScanner(stock_list=stock_list, include_today=include_today)
             scanner.scan_stocks()
             scanner.print_buy_signals()
             scanner.save_results()
@@ -923,7 +1023,8 @@ def main():
         # 扫描单个股票
         stock_code = input("请输入股票代码: ").strip()
         stock_name = input("请输入股票名称 (可选): ").strip() or stock_code
-        analyzer = BuySignalAnalyzer(stock_code, stock_name)
+        analyzer = BuySignalAnalyzer(stock_code, stock_name, include_today=include_today)
+        
         # 使用实际数据进行完整分析
         analyzer.run_analysis()
             
@@ -932,6 +1033,8 @@ def main():
         print("\n分析结果:")
         print(f"股票代码: {result['股票代码']}")
         print(f"股票名称: {result['股票名称']}")
+        if not include_today:
+            print("注意: 分析不包含今天的数据")
         
         if result['最新价格'] is not None:
             print(f"最新价格: {result['最新价格']:.2f}")
@@ -981,6 +1084,25 @@ def main():
             scanner.results = single_result
             filename = f"{result['股票代码']}_{result['股票名称']}_分析结果.xlsx"
             scanner.save_results(filename)
+    
+    elif choice == "4":
+        # 扫描所有新开户可买股票
+        try:
+            limit = input("请输入要分析的股票数量上限（默认为300只）: ").strip()
+            limit = int(limit) if limit else 300
+            
+            scanner = StockScanner(new_account_only=True, include_today=include_today)
+            if scanner.load_new_account_stocks(limit):
+                print(f"成功加载 {len(scanner.stock_list)} 只新开户可买股票")
+                scanner.scan_stocks()
+                scanner.print_buy_signals()
+                scanner.save_results()
+            else:
+                print("加载新开户可买股票失败")
+        except Exception as e:
+            print(f"扫描新开户可买股票时出错: {e}")
+            import traceback
+            traceback.print_exc()
     
     else:
         print("无效的选择")
