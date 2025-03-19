@@ -49,7 +49,8 @@ class BuySignalAnalyzer:
             "rsi_period": 14,
             "rsi_oversold": 30,
             "volume_ratio": 1.5,
-            "ma_convergence_threshold": 0.005,
+            "ma_convergence_threshold": 0.001,  # 均线聚合阈值
+            "ma_rising_threshold": 0.002,      # 均线上涨阈值
             # 新增指标参数
             "kdj_period": 9,
             "kdj_signal_period": 3,
@@ -63,7 +64,7 @@ class BuySignalAnalyzer:
         self.weights = {
             "强势突破": 30,
             "低吸回调": 25,
-            "均线聚合": 20,
+            "三线合一上涨": 20,  # 修改为三线合一上涨
             "KDJ金叉": 5,
             "BIAS回归": 5,
             "CCI超买超卖": 5,
@@ -220,7 +221,7 @@ class BuySignalAnalyzer:
         signals = {
             "强势突破": False,
             "低吸回调": False,
-            "均线聚合": False,
+            "三线合一上涨": False,
             "信号详情": {}
         }
         
@@ -302,7 +303,7 @@ class BuySignalAnalyzer:
             "非下跌趋势": trend != 'down'
         }
         
-        # 3. 均线聚合买入信号
+        # 3. 三线合一上涨买入信号
         # 计算均线之间的距离
         ma5_ma10_distance = abs(latest['sma5'] - latest['sma10']) / latest['sma5']
         ma10_ma20_distance = abs(latest['sma10'] - latest['sma20']) / latest['sma10']
@@ -311,44 +312,41 @@ class BuySignalAnalyzer:
         ma_convergence = (ma5_ma10_distance < self.params['ma_convergence_threshold'] and 
                          ma10_ma20_distance < self.params['ma_convergence_threshold'])
         
+        # 均线方向向上
+        ma5_rising = latest['sma5_slope'] > self.params['ma_rising_threshold']
+        ma10_rising = latest['sma10_slope'] > self.params['ma_rising_threshold']
+        ma20_rising = latest['sma20_slope'] > self.params['ma_rising_threshold']
+        
         # 价格站上所有均线
         price_above_mas = (latest['close'] > latest['sma5'] and 
                           latest['close'] > latest['sma10'] and 
                           latest['close'] > latest['sma20'])
         
-        # 均线方向向上
-        ma_direction_up = latest['sma5_slope'] > 0 and latest['sma10_slope'] > 0
-        
-        # MACD柱状图为正或向上
-        macd_positive_or_rising = False
-        if prev is not None:
-            macd_positive_or_rising = latest['macd_hist'] > 0 or (latest['macd_hist'] > prev['macd_hist'])
-        
-        # 均线聚合买入信号
-        ma_convergence_signal = (
-            ma_convergence and 
-            price_above_mas and 
-            ma_direction_up and 
-            macd_positive_or_rising and
-            trend != 'down'
+        # 三线合一上涨信号
+        three_line_up_signal = (
+            ma_convergence and  # 均线聚合
+            ma5_rising and      # 5日均线向上
+            ma10_rising and     # 10日均线向上
+            ma20_rising and     # 20日均线向上
+            price_above_mas     # 价格站上均线
         )
         
-        signals["均线聚合"] = ma_convergence_signal
-        signals["信号详情"]["均线聚合"] = {
+        signals["三线合一上涨"] = three_line_up_signal
+        signals["信号详情"]["三线合一上涨"] = {
             "均线聚合": ma_convergence,
             "MA5-MA10距离": ma5_ma10_distance,
             "MA10-MA20距离": ma10_ma20_distance,
-            "价格站上均线": price_above_mas,
-            "均线向上": ma_direction_up,
-            "MACD状态": macd_positive_or_rising,
-            "非下跌趋势": trend != 'down'
+            "5日均线向上": ma5_rising,
+            "10日均线向上": ma10_rising,
+            "20日均线向上": ma20_rising,
+            "价格站上均线": price_above_mas
         }
         
         # 分析新增的技术指标信号
         self.analyze_additional_signals(signals, latest, prev)
         
         # 综合买入信号
-        signals["任一买入信号"] = signals["强势突破"] or signals["低吸回调"] or signals["均线聚合"] or signals["KDJ金叉"] or signals["BIAS回归"] or signals["CCI超买超卖"] or signals["OBV增长"] or signals["量价配合"]
+        signals["任一买入信号"] = signals["强势突破"] or signals["低吸回调"] or signals["三线合一上涨"] or signals["KDJ金叉"] or signals["BIAS回归"] or signals["CCI超买超卖"] or signals["OBV增长"] or signals["量价配合"]
         
         # 计算综合得分
         self.calculate_score(signals)
@@ -491,7 +489,7 @@ class BuySignalAnalyzer:
                 "任一买入信号": False,
                 "强势突破": False,
                 "低吸回调": False,
-                "均线聚合": False,
+                "三线合一上涨": False,
                 "KDJ金叉": False,
                 "BIAS回归": False,
                 "CCI超买超卖": False,
@@ -528,7 +526,7 @@ class BuySignalAnalyzer:
             "任一买入信号": self.buy_signals["任一买入信号"],
             "强势突破": self.buy_signals["强势突破"],
             "低吸回调": self.buy_signals["低吸回调"],
-            "均线聚合": self.buy_signals["均线聚合"],
+            "三线合一上涨": self.buy_signals["三线合一上涨"],
             "KDJ金叉": self.buy_signals.get("KDJ金叉", False),
             "BIAS回归": self.buy_signals.get("BIAS回归", False),
             "CCI超买超卖": self.buy_signals.get("CCI超买超卖", False),
@@ -706,7 +704,7 @@ class StockScanner:
                 "任一买入信号": False,
                 "强势突破": False,
                 "低吸回调": False,
-                "均线聚合": False,
+                "三线合一上涨": False,
                 "KDJ金叉": False,
                 "BIAS回归": False,
                 "CCI超买超卖": False,
@@ -748,7 +746,7 @@ class StockScanner:
         print(f"扫描完成，耗时 {end_time - start_time:.2f} 秒")
         
         # 按照是否有买入信号排序
-        results.sort(key=lambda x: (not x["任一买入信号"], not x["强势突破"], not x["低吸回调"], not x["均线聚合"]))
+        results.sort(key=lambda x: (not x["任一买入信号"], not x["强势突破"], not x["低吸回调"], not x["三线合一上涨"]))
         
         self.results = results
         return results
@@ -779,7 +777,7 @@ class StockScanner:
                 "任一买入信号": result["任一买入信号"],
                 "强势突破": result["强势突破"],
                 "低吸回调": result["低吸回调"],
-                "均线聚合": result["均线聚合"],
+                "三线合一上涨": result["三线合一上涨"],
                 "KDJ金叉": result["KDJ金叉"],
                 "BIAS回归": result["BIAS回归"],
                 "CCI超买超卖": result["CCI超买超卖"],
@@ -837,7 +835,7 @@ class StockScanner:
             center_alignment = Alignment(horizontal='center')
             for row_idx in range(2, len(df) + 2):
                 for col_idx, col_name in enumerate(df.columns, start=1):
-                    if col_name in ["任一买入信号", "强势突破", "低吸回调", "均线聚合", "KDJ金叉", "BIAS回归", "CCI超买超卖", "OBV增长", "量价配合"]:
+                    if col_name in ["任一买入信号", "强势突破", "低吸回调", "三线合一上涨", "KDJ金叉", "BIAS回归", "CCI超买超卖", "OBV增长", "量价配合"]:
                         cell = worksheet.cell(row=row_idx, column=col_idx)
                         cell.alignment = center_alignment
                         if cell.value == True:
@@ -882,11 +880,11 @@ class StockScanner:
             
             # 创建信号详情工作表
             signals_df = pd.DataFrame({
-                "信号类型": ["强势突破", "低吸回调", "均线聚合", "KDJ金叉", "BIAS回归", "CCI超买超卖", "OBV增长", "量价配合"],
+                "信号类型": ["强势突破", "低吸回调", "三线合一上涨", "KDJ金叉", "BIAS回归", "CCI超买超卖", "OBV增长", "量价配合"],
                 "信号权重": [
                     self.results[0].get("分析器", {}).get("权重", {}).get("强势突破", 30) if len(self.results) > 0 else 30,
                     self.results[0].get("分析器", {}).get("权重", {}).get("低吸回调", 25) if len(self.results) > 0 else 25,
-                    self.results[0].get("分析器", {}).get("权重", {}).get("均线聚合", 20) if len(self.results) > 0 else 20,
+                    self.results[0].get("分析器", {}).get("权重", {}).get("三线合一上涨", 20) if len(self.results) > 0 else 20,
                     self.results[0].get("分析器", {}).get("权重", {}).get("KDJ金叉", 5) if len(self.results) > 0 else 5,
                     self.results[0].get("分析器", {}).get("权重", {}).get("BIAS回归", 5) if len(self.results) > 0 else 5,
                     self.results[0].get("分析器", {}).get("权重", {}).get("CCI超买超卖", 5) if len(self.results) > 0 else 5,
@@ -896,7 +894,7 @@ class StockScanner:
                 "信号说明": [
                     "股票呈现强势上涨趋势，均线多头排列且向上，价格站上均线，成交量配合",
                     "股价在超卖区间出现反弹迹象，RSI超卖或价格接近布林带下轨",
-                    "均线高度聚合，预示趋势即将形成，价格在均线上方，MACD柱状图为正或向上",
+                    "5日、10日、20日均线高度聚合且同时向上，价格站上所有均线，预示强势上涨趋势形成",
                     "KDJ指标形成金叉或从超卖区域反弹",
                     "BIAS乖离率回归零轴或从超卖区域反弹",
                     "CCI指标从超卖区域反弹或回归零轴",
@@ -947,7 +945,7 @@ class StockScanner:
         print("-" * 120)
         
         # 构建表头
-        headers = ["股票代码", "股票名称", "评分", "最新价格", "强势突破", "低吸回调", "均线聚合", "KDJ金叉", "BIAS回归", "CCI信号", "OBV增长", "量价配合"]
+        headers = ["股票代码", "股票名称", "评分", "最新价格", "强势突破", "低吸回调", "三线合一上涨", "KDJ金叉", "BIAS回归", "CCI信号", "OBV增长", "量价配合"]
         header_format = "{:<10}{:<15}{:<8}{:<10}{:<10}{:<10}{:<10}{:<10}{:<10}{:<10}{:<10}{:<10}"
         print(header_format.format(*headers))
         
@@ -963,7 +961,7 @@ class StockScanner:
                 signal['最新价格'],
                 "✓" if signal['强势突破'] else "",
                 "✓" if signal['低吸回调'] else "",
-                "✓" if signal['均线聚合'] else "",
+                "✓" if signal['三线合一上涨'] else "",
                 "✓" if signal.get('KDJ金叉', False) else "",
                 "✓" if signal.get('BIAS回归', False) else "",
                 "✓" if signal.get('CCI超买超卖', False) else "",
@@ -1048,7 +1046,7 @@ def main():
         print("\n信号触发情况:")
         print(f"强势突破: {'是' if result['强势突破'] else '否'}")
         print(f"低吸回调: {'是' if result['低吸回调'] else '否'}")
-        print(f"均线聚合: {'是' if result['均线聚合'] else '否'}")
+        print(f"三线合一上涨: {'是' if result['三线合一上涨'] else '否'}")
         print(f"KDJ金叉: {'是' if result['KDJ金叉'] else '否'}")
         print(f"BIAS回归: {'是' if result['BIAS回归'] else '否'}")
         print(f"CCI超买超卖: {'是' if result['CCI超买超卖'] else '否'}")
