@@ -49,7 +49,7 @@ class BuySignalAnalyzer:
             "rsi_period": 14,
             "rsi_oversold": 30,
             "volume_ratio": 1.5,
-            "ma_convergence_threshold": 0.001,  # 均线聚合阈值
+            "ma_convergence_threshold": 0.01,  # 均线聚合阈值
             "ma_rising_threshold": 0.002,      # 均线上涨阈值
             # 新增指标参数
             "kdj_period": 9,
@@ -58,6 +58,8 @@ class BuySignalAnalyzer:
             "cci_period": 14,
             "atr_period": 14,
             "obv_period": 20,
+            "volume_surge_ratio": 1.8,        # 成交量突然放大的比例
+            "potential_ma_cross_threshold": 0.002, # 潜在均线金叉阈值
         }
         
         # 评分权重
@@ -69,7 +71,8 @@ class BuySignalAnalyzer:
             "BIAS回归": 5,
             "CCI超买超卖": 5,
             "OBV增长": 5,
-            "量价配合": 5
+            "量价配合": 5,
+            "趋势起点": 30,  # 新增趋势起点权重
         }
         
     def load_data(self):
@@ -222,6 +225,7 @@ class BuySignalAnalyzer:
             "强势突破": False,
             "低吸回调": False,
             "三线合一上涨": False,
+            "趋势起点": False,  # 新增趋势起点信号
             "信号详情": {}
         }
         
@@ -342,11 +346,46 @@ class BuySignalAnalyzer:
             "价格站上均线": price_above_mas
         }
         
+        # 4. 趋势起点信号 - 新增
+        trend_starting = self.is_trend_starting_point(latest, prev)
+        signals["趋势起点"] = trend_starting
+        
+        # 获取趋势起点详情
+        trend_starting_details = {}
+        if prev is not None:
+            trend_starting_details = {
+                "成交量突然放大": latest['volume'] > prev['volume'] * self.params['volume_surge_ratio'],
+                "均线即将金叉": (
+                    abs(latest['sma5'] - latest['sma10']) < latest['close'] * self.params['potential_ma_cross_threshold'] and 
+                    latest['sma5_slope'] > 0 and 
+                    latest['sma5'] < latest['sma10']
+                ),
+                "价格处于底部": (
+                    latest['close'] < latest['bb_lower'] * 1.02 and
+                    latest['rsi'] < 35
+                ),
+                "MACD即将金叉": (
+                    abs(latest['macd'] - latest['macd_signal']) < 0.02 and
+                    latest['macd'] < latest['macd_signal'] and
+                    latest['macd_hist'] > prev['macd_hist']
+                )
+            }
+        
+        signals["信号详情"]["趋势起点"] = trend_starting_details
+        
         # 分析新增的技术指标信号
         self.analyze_additional_signals(signals, latest, prev)
         
         # 综合买入信号
-        signals["任一买入信号"] = signals["强势突破"] or signals["低吸回调"] or signals["三线合一上涨"] or signals["KDJ金叉"] or signals["BIAS回归"] or signals["CCI超买超卖"] or signals["OBV增长"] or signals["量价配合"]
+        signals["任一买入信号"] = (signals["强势突破"] or 
+                               signals["低吸回调"] or 
+                               signals["三线合一上涨"] or 
+                               signals["趋势起点"] or  # 加入趋势起点判断
+                               signals["KDJ金叉"] or 
+                               signals["BIAS回归"] or 
+                               signals["CCI超买超卖"] or 
+                               signals["OBV增长"] or 
+                               signals["量价配合"])
         
         # 计算综合得分
         self.calculate_score(signals)
@@ -436,49 +475,83 @@ class BuySignalAnalyzer:
         """计算综合评分"""
         score = 0
         
-        # 基于信号计算得分
-        for signal_name, weight in self.weights.items():
-            if signal_name in signals and signals[signal_name]:
-                score += weight
-                
         # 获取最新数据
         latest = self.data.iloc[-1]
+        prev = self.data.iloc[-2] if len(self.data) > 1 else None
         
-        # 加分项：根据交易量、价格和指标走势增加额外得分
+        # 1. 基于信号类型的加权得分 (50分)
+        # 趋势起点信号优先级最高
+        if signals["趋势起点"]:
+            score += self.weights.get("趋势起点", 30)
         
-        # 1. MACD方向加分
-        if 'macd_hist' in self.data.columns and len(self.data) > 1:
-            prev = self.data.iloc[-2]
-            if latest['macd_hist'] > 0 and latest['macd_hist'] > prev['macd_hist']:
-                score += 3
+        # 其他信号按权重计算
+        for signal_name, weight in self.weights.items():
+            if signal_name != "趋势起点" and signal_name in signals and signals[signal_name]:
+                score += weight
                 
-        # 2. RSI状态加分
-        if 'rsi' in self.data.columns:
-            if 30 <= latest['rsi'] <= 70:  # 健康区间
-                score += 2
-            elif latest['rsi'] > 70:  # 超买区间扣分
-                score -= 2
+        # 2. 价格位置评分 (20分)
+        if 'bb_lower' in self.data.columns and 'bb_middle' in self.data.columns:
+            if latest['close'] < latest['bb_lower'] * 1.05:  # 接近布林带下轨
+                score += 20
+            elif latest['close'] < latest['bb_middle']:  # 位于布林带中下方
+                score += 10
                 
-        # 3. 均线方向加分
-        if all(latest[f'sma{period}_slope'] > 0 for period in [5, 10, 20]):
-            score += 3
+        # 3. 成交量变化评分 (20分)
+        if 'volume_ma20' in self.data.columns:
+            if latest['volume'] > latest['volume_ma20'] * 1.8:
+                score += 20
+            elif latest['volume'] > latest['volume_ma20'] * 1.3:
+                score += 10
+                
+        # 4. 技术指标组合评分 (30分)
+        # RSI超卖
+        if 'rsi' in self.data.columns and latest['rsi'] < 35:
+            score += 10
             
-        # 4. ATR波动率考虑
-        if 'atr' in self.data.columns and 'close' in self.data.columns:
-            atr_percent = latest['atr'] / latest['close'] * 100
-            if atr_percent < 2:  # 波动率较低
-                score += 2
+        # MACD底部上扬
+        if 'macd' in self.data.columns and prev is not None and latest['macd'] > prev['macd'] and latest['macd'] < 0:
+            score += 10
+            
+        # KDJ超卖
+        if 'kdj_j' in self.data.columns and latest['kdj_j'] < 20:
+            score += 10
+            
+        # 5. 排除近期涨幅过大的股票 (减分)
+        if len(self.data) > 20:
+            # 计算过去20日涨幅
+            price_20d_ago = self.data.iloc[-20]['close'] if len(self.data) >= 20 else self.data.iloc[0]['close']
+            price_change_20d = (latest['close'] - price_20d_ago) / price_20d_ago
+            
+            if price_change_20d > 0.3:  # 近20日涨幅超过30%
+                score -= 20
+            elif price_change_20d > 0.2:  # 近20日涨幅超过20%
+                score -= 10
                 
-        # 5. 价格位置考虑
-        if 'bb_middle' in self.data.columns and 'bb_upper' in self.data.columns:
-            price_position = (latest['close'] - latest['bb_lower']) / (latest['bb_upper'] - latest['bb_lower'])
-            if 0.3 <= price_position <= 0.7:  # 价格在布林带中间位置
-                score += 2
-            elif price_position > 0.8:  # 接近上轨扣分
-                score -= 2
+        # 6. 检查均线多头排列持续时间 (减分)
+        if latest['sma5'] > latest['sma10'] > latest['sma20']:
+            # 计算多头排列持续天数
+            ma_aligned_days = 0
+            for i in range(len(self.data)-1, 0, -1):
+                row = self.data.iloc[i]
+                if row['sma5'] > row['sma10'] > row['sma20']:
+                    ma_aligned_days += 1
+                else:
+                    break
+                    
+            if ma_aligned_days > 20:  # 多头排列超过20天
+                score -= 10
                 
+        # 7. 价格距离均线过远 (减分)
+        if 'sma20' in self.data.columns:
+            price_ma20_gap = (latest['close'] - latest['sma20']) / latest['sma20']
+            if price_ma20_gap > 0.1:  # 价格比20日均线高10%以上
+                score -= 10
+                
+        # 8. 验证信号历史有效性 (加分)
+        # 这部分可以扩展为调用一个计算历史成功率的函数
+        
         # 保存得分
-        self.score = score
+        self.score = max(0, score)  # 确保分数不为负
     
     def get_result(self):
         """获取分析结果"""
@@ -490,6 +563,7 @@ class BuySignalAnalyzer:
                 "强势突破": False,
                 "低吸回调": False,
                 "三线合一上涨": False,
+                "趋势起点": False,  # 新增趋势起点
                 "KDJ金叉": False,
                 "BIAS回归": False,
                 "CCI超买超卖": False,
@@ -519,6 +593,19 @@ class BuySignalAnalyzer:
                 "SMA20": latest.get('sma20', None),
                 "SMA60": latest.get('sma60', None)
             }
+            
+            # 添加20日涨幅
+            if len(self.data) >= 20:
+                price_20d_ago = self.data.iloc[-20]['close']
+                latest_indicators["涨幅20日"] = (latest['close'] - price_20d_ago) / price_20d_ago * 100
+            
+            # 添加成交量变化率
+            if len(self.data) >= 2:
+                prev = self.data.iloc[-2]
+                latest_indicators["成交量变化率"] = (latest['volume'] - prev['volume']) / prev['volume'] * 100
+        
+        # 计算信号历史有效性
+        signal_effectiveness = self.validate_signal_effectiveness()
         
         return {
             "股票代码": self.stock_code,
@@ -527,6 +614,7 @@ class BuySignalAnalyzer:
             "强势突破": self.buy_signals["强势突破"],
             "低吸回调": self.buy_signals["低吸回调"],
             "三线合一上涨": self.buy_signals["三线合一上涨"],
+            "趋势起点": self.buy_signals.get("趋势起点", False),  # 新增趋势起点
             "KDJ金叉": self.buy_signals.get("KDJ金叉", False),
             "BIAS回归": self.buy_signals.get("BIAS回归", False),
             "CCI超买超卖": self.buy_signals.get("CCI超买超卖", False),
@@ -535,7 +623,8 @@ class BuySignalAnalyzer:
             "综合评分": self.score,
             "最新价格": latest_price,
             "信号详情": self.buy_signals["信号详情"],
-            "技术指标": latest_indicators
+            "技术指标": latest_indicators,
+            "历史信号成功率": signal_effectiveness  # 新增历史信号成功率
         }
     
     def run_analysis(self):
@@ -548,6 +637,139 @@ class BuySignalAnalyzer:
         
         self.analyze_buy_signals()
         return self.get_result()
+
+    def is_trend_starting_point(self, latest, prev):
+        """
+        判断是否为趋势起点
+        
+        参数:
+        latest: 最新数据点
+        prev: 前一个数据点
+        
+        返回:
+        bool: 是否为趋势起点
+        """
+        if prev is None:
+            return False
+            
+        # 1. 成交量突然放大
+        volume_surge = latest['volume'] > prev['volume'] * self.params['volume_surge_ratio']
+        
+        # 2. 均线金叉即将发生
+        ma_cross_coming = (
+            abs(latest['sma5'] - latest['sma10']) < latest['close'] * self.params['potential_ma_cross_threshold'] and 
+            latest['sma5_slope'] > 0 and 
+            latest['sma5'] < latest['sma10']
+        )
+        
+        # 3. 价格处于底部区域
+        price_at_bottom = (
+            latest['close'] < latest['bb_lower'] * 1.02 and
+            latest['rsi'] < 35
+        )
+        
+        # 4. MACD即将金叉
+        macd_cross_coming = (
+            abs(latest['macd'] - latest['macd_signal']) < 0.02 and
+            latest['macd'] < latest['macd_signal'] and
+            latest['macd_hist'] > prev['macd_hist']
+        )
+        
+        # 5. 多日横盘后放量上涨
+        sideways_breakout = False
+        if len(self.data) > 5:  # 至少需要5天数据
+            # 计算过去5天的最高和最低价格
+            past_5d_high = max(self.data.iloc[-6:-1]['high'])
+            past_5d_low = min(self.data.iloc[-6:-1]['low'])
+            price_range = (past_5d_high - past_5d_low) / past_5d_low
+            
+            # 如果之前5天横盘(振幅小)，且今天突破
+            sideways_breakout = (
+                price_range < 0.03 and  # 之前5天振幅小于3%
+                latest['close'] > past_5d_high * 1.01 and  # 今天收盘价突破前5天最高价
+                latest['volume'] > self.data.iloc[-6:-1]['volume'].mean() * 1.5  # 今天成交量放大
+            )
+        
+        return (volume_surge and (ma_cross_coming or price_at_bottom or macd_cross_coming)) or sideways_breakout
+
+    def validate_signal_effectiveness(self):
+        """
+        验证信号有效性，检查历史上同样的信号出现后的表现
+        返回: 历史信号成功率百分比，或0如果无法计算
+        """
+        if self.data is None or len(self.data) < 60:  # 至少需要60天数据
+            return 0
+            
+        success_rate = 0
+        total_signals = 0
+        
+        # 遍历历史数据，留出至少5天验证
+        for i in range(30, len(self.data)-5):
+            historical_data = self.data.iloc[:i+1].copy()
+            future_data = self.data.iloc[i+1:i+6]  # 未来5天数据
+            
+            # 检查当前位置是否有买入信号
+            signal_found = self.check_historical_signals(historical_data)
+            
+            if signal_found:
+                total_signals += 1
+                # 计算未来5天的最大涨幅
+                future_max_price = future_data['high'].max()
+                current_price = historical_data.iloc[-1]['close']
+                max_gain = (future_max_price - current_price) / current_price
+                
+                # 如果未来5天内最大涨幅超过3%，则认为信号有效
+                if max_gain > 0.03:
+                    success_rate += 1
+        
+        if total_signals > 0:
+            return (success_rate / total_signals) * 100
+        return 0
+    
+    def check_historical_signals(self, historical_data):
+        """
+        检查历史数据某个点是否有买入信号
+        参数:
+        historical_data: 截止到某个时间点的历史数据
+        
+        返回:
+        bool: 是否有买入信号
+        """
+        if len(historical_data) < 20:  # 需要足够数据计算指标
+            return False
+            
+        # 获取最后一个数据点
+        latest = historical_data.iloc[-1]
+        prev = historical_data.iloc[-2] if len(historical_data) > 1 else None
+        
+        if prev is None:
+            return False
+            
+        # 简化版的信号检测，重点检测趋势起点
+        
+        # 1. 成交量突然放大
+        volume_surge = latest['volume'] > prev['volume'] * self.params['volume_surge_ratio']
+        
+        # 2. RSI超卖
+        rsi_oversold = False
+        if 'rsi' in historical_data.columns:
+            rsi_oversold = latest['rsi'] < 35
+        
+        # 3. 接近布林带下轨
+        near_lower_band = False
+        if 'bb_lower' in historical_data.columns:
+            near_lower_band = latest['close'] < latest['bb_lower'] * 1.05
+        
+        # 4. MACD底部转向
+        macd_turning = False
+        if 'macd' in historical_data.columns and 'macd_hist' in historical_data.columns:
+            macd_turning = (latest['macd_hist'] > prev['macd_hist'] and latest['macd'] < 0)
+        
+        # 5. 价格企稳回升
+        price_stabilizing = latest['close'] > latest['open'] and prev['close'] > prev['open']
+        
+        # 组合信号
+        return (volume_surge and (rsi_oversold or near_lower_band or macd_turning)) or (price_stabilizing and (rsi_oversold or near_lower_band))
 
 
 class StockScanner:
@@ -775,6 +997,7 @@ class StockScanner:
                 "股票名称": result["股票名称"],
                 "综合评分": result["综合评分"],
                 "任一买入信号": result["任一买入信号"],
+                "趋势起点": result.get("趋势起点", False),  # 新增趋势起点
                 "强势突破": result["强势突破"],
                 "低吸回调": result["低吸回调"],
                 "三线合一上涨": result["三线合一上涨"],
@@ -783,7 +1006,10 @@ class StockScanner:
                 "CCI超买超卖": result["CCI超买超卖"],
                 "OBV增长": result["OBV增长"],
                 "量价配合": result["量价配合"],
+                "历史信号成功率": result.get("历史信号成功率", 0),  # 新增历史信号成功率
                 "最新价格": result["最新价格"],
+                "涨幅20日(%)": result.get("技术指标", {}).get("涨幅20日", None),  # 新增20日涨幅
+                "成交量变化率(%)": result.get("技术指标", {}).get("成交量变化率", None),  # 新增成交量变化率
                 "RSI": result.get("技术指标", {}).get("RSI", None),
                 "KDJ_J": result.get("技术指标", {}).get("KDJ_J", None),
                 "BIAS": result.get("技术指标", {}).get("BIAS", None),
@@ -798,6 +1024,17 @@ class StockScanner:
         # 创建DataFrame并处理空值
         df = pd.DataFrame(data)
         df = df.fillna("")  # 将NaN值替换为空字符串
+        
+        # 按照新的排序规则重新排序结果
+        # 优先排序规则：1.趋势起点 2.综合评分 3.历史信号成功率
+        df['排序值'] = 0
+        # 趋势起点为最高优先级
+        df.loc[df['趋势起点'] == True, '排序值'] += 1000
+        # 加上评分值和历史成功率
+        df['排序值'] += df['综合评分'] + df['历史信号成功率'] * 0.5
+        # 按照排序值降序排列
+        df = df.sort_values(by='排序值', ascending=False)
+        df = df.drop(columns=['排序值'])
         
         # 使用ExcelWriter保存为Excel文件
         with pd.ExcelWriter(filename, engine='openpyxl') as writer:
@@ -825,9 +1062,15 @@ class StockScanner:
             
             # 为有买入信号的行添加背景色
             green_fill = PatternFill(fgColor="D8F0D8", fill_type="solid")  # 浅绿色
+            light_yellow_fill = PatternFill(fgColor="FFFFC0", fill_type="solid")  # 浅黄色，用于趋势起点
             
             for row_idx, row in enumerate(df.itertuples(), start=2):
-                if row.任一买入信号:
+                if getattr(row, '趋势起点', False):
+                    # 趋势起点使用浅黄色背景突出显示
+                    for col_idx in range(1, len(df.columns) + 1):
+                        worksheet.cell(row=row_idx, column=col_idx).fill = light_yellow_fill
+                elif row.任一买入信号:
+                    # 其他买入信号使用浅绿色
                     for col_idx in range(1, len(df.columns) + 1):
                         worksheet.cell(row=row_idx, column=col_idx).fill = green_fill
             
@@ -835,7 +1078,7 @@ class StockScanner:
             center_alignment = Alignment(horizontal='center')
             for row_idx in range(2, len(df) + 2):
                 for col_idx, col_name in enumerate(df.columns, start=1):
-                    if col_name in ["任一买入信号", "强势突破", "低吸回调", "三线合一上涨", "KDJ金叉", "BIAS回归", "CCI超买超卖", "OBV增长", "量价配合"]:
+                    if col_name in ["任一买入信号", "趋势起点", "强势突破", "低吸回调", "三线合一上涨", "KDJ金叉", "BIAS回归", "CCI超买超卖", "OBV增长", "量价配合"]:
                         cell = worksheet.cell(row=row_idx, column=col_idx)
                         cell.alignment = center_alignment
                         if cell.value == True:
@@ -855,6 +1098,28 @@ class StockScanner:
                 if score_cell.value:
                     score_cell.number_format = "#,##0.0"
                 
+                # 设置成功率格式
+                if "历史信号成功率" in df.columns:
+                    success_rate_cell = worksheet.cell(row=row_idx, column=df.columns.get_loc("历史信号成功率") + 1)
+                    if success_rate_cell.value:
+                        success_rate_cell.number_format = "#,##0.0"
+                
+                # 设置涨幅和成交量变化率格式
+                if "涨幅20日(%)" in df.columns:
+                    change_cell = worksheet.cell(row=row_idx, column=df.columns.get_loc("涨幅20日(%)") + 1)
+                    if change_cell.value:
+                        change_cell.number_format = "#,##0.00"
+                        # 设置涨幅颜色
+                        if isinstance(change_cell.value, (int, float)) and change_cell.value > 0:
+                            change_cell.font = Font(color="FF0000")  # 红色
+                        elif isinstance(change_cell.value, (int, float)) and change_cell.value < 0:
+                            change_cell.font = Font(color="008000")  # 绿色
+                
+                if "成交量变化率(%)" in df.columns:
+                    vol_change_cell = worksheet.cell(row=row_idx, column=df.columns.get_loc("成交量变化率(%)") + 1)
+                    if vol_change_cell.value:
+                        vol_change_cell.number_format = "#,##0.00"
+                
                 # 设置技术指标格式
                 for indicator in ["RSI", "KDJ_J", "BIAS", "CCI", "MACD", "ATR", "SMA5", "SMA10", "SMA20"]:
                     if indicator in df.columns:
@@ -868,7 +1133,9 @@ class StockScanner:
                 score_cell = worksheet.cell(row=row_idx, column=score_col)
                 if score_cell.value:
                     score_value = float(score_cell.value)
-                    if score_value >= 50:
+                    if score_value >= 60:  # 提高阈值
+                        score_cell.font = Font(color="006100", bold=True)  # 加粗的深绿色
+                    elif score_value >= 40:  # 中等评分
                         score_cell.font = Font(color="006100")  # 深绿色
                     elif score_value >= 30:
                         score_cell.font = Font(color="9C5700")  # 橙色
@@ -880,18 +1147,20 @@ class StockScanner:
             
             # 创建信号详情工作表
             signals_df = pd.DataFrame({
-                "信号类型": ["强势突破", "低吸回调", "三线合一上涨", "KDJ金叉", "BIAS回归", "CCI超买超卖", "OBV增长", "量价配合"],
+                "信号类型": ["趋势起点", "强势突破", "低吸回调", "三线合一上涨", "KDJ金叉", "BIAS回归", "CCI超买超卖", "OBV增长", "量价配合"],
                 "信号权重": [
-                    self.results[0].get("分析器", {}).get("权重", {}).get("强势突破", 30) if len(self.results) > 0 else 30,
-                    self.results[0].get("分析器", {}).get("权重", {}).get("低吸回调", 25) if len(self.results) > 0 else 25,
-                    self.results[0].get("分析器", {}).get("权重", {}).get("三线合一上涨", 20) if len(self.results) > 0 else 20,
-                    self.results[0].get("分析器", {}).get("权重", {}).get("KDJ金叉", 5) if len(self.results) > 0 else 5,
-                    self.results[0].get("分析器", {}).get("权重", {}).get("BIAS回归", 5) if len(self.results) > 0 else 5,
-                    self.results[0].get("分析器", {}).get("权重", {}).get("CCI超买超卖", 5) if len(self.results) > 0 else 5,
-                    self.results[0].get("分析器", {}).get("权重", {}).get("OBV增长", 5) if len(self.results) > 0 else 5,
-                    self.results[0].get("分析器", {}).get("权重", {}).get("量价配合", 5) if len(self.results) > 0 else 5
+                    30,  # 趋势起点
+                    30,  # 强势突破
+                    25,  # 低吸回调
+                    20,  # 三线合一上涨
+                    5,   # KDJ金叉
+                    5,   # BIAS回归
+                    5,   # CCI超买超卖
+                    5,   # OBV增长
+                    5    # 量价配合
                 ],
                 "信号说明": [
+                    "股票可能处于趋势转折点，出现成交量突然放大、均线即将金叉、价格处于底部或MACD即将金叉等特征",
                     "股票呈现强势上涨趋势，均线多头排列且向上，价格站上均线，成交量配合",
                     "股价在超卖区间出现反弹迹象，RSI超卖或价格接近布林带下轨",
                     "5日、10日、20日均线高度聚合且同时向上，价格站上所有均线，预示强势上涨趋势形成",
@@ -938,27 +1207,28 @@ class StockScanner:
             print("没有股票触发买入信号")
             return
             
-        # 按照综合评分排序
-        buy_signals.sort(key=lambda x: x.get("综合评分", 0), reverse=True)
+        # 先按照是否为趋势起点排序，再按照综合评分排序
+        buy_signals.sort(key=lambda x: (not x.get("趋势起点", False), -x.get("综合评分", 0)))
             
         print(f"\n共有 {len(buy_signals)} 只股票触发买入信号:")
-        print("-" * 120)
+        print("-" * 130)
         
         # 构建表头
-        headers = ["股票代码", "股票名称", "评分", "最新价格", "强势突破", "低吸回调", "三线合一上涨", "KDJ金叉", "BIAS回归", "CCI信号", "OBV增长", "量价配合"]
-        header_format = "{:<10}{:<15}{:<8}{:<10}{:<10}{:<10}{:<10}{:<10}{:<10}{:<10}{:<10}{:<10}"
+        headers = ["股票代码", "股票名称", "评分", "最新价格", "趋势起点", "强势突破", "低吸回调", "三线合一", "KDJ金叉", "BIAS回归", "CCI信号", "OBV增长", "量价配合", "历史成功率"]
+        header_format = "{:<10}{:<15}{:<8}{:<10}{:<10}{:<10}{:<10}{:<10}{:<10}{:<10}{:<10}{:<10}{:<10}{:<12}"
         print(header_format.format(*headers))
         
-        print("-" * 120)
+        print("-" * 130)
         
         # 打印每只股票
-        row_format = "{:<10}{:<15}{:<8.1f}{:<10.2f}{:<10}{:<10}{:<10}{:<10}{:<10}{:<10}{:<10}"
+        row_format = "{:<10}{:<15}{:<8.1f}{:<10.2f}{:<10}{:<10}{:<10}{:<10}{:<10}{:<10}{:<10}{:<10}{:<10}{:<12.1f}"
         for signal in buy_signals:
             print(row_format.format(
                 signal['股票代码'],
                 signal['股票名称'],
                 signal.get('综合评分', 0),
                 signal['最新价格'],
+                "★★★" if signal.get('趋势起点', False) else "",  # 使用星号突出显示趋势起点
                 "✓" if signal['强势突破'] else "",
                 "✓" if signal['低吸回调'] else "",
                 "✓" if signal['三线合一上涨'] else "",
@@ -966,9 +1236,13 @@ class StockScanner:
                 "✓" if signal.get('BIAS回归', False) else "",
                 "✓" if signal.get('CCI超买超卖', False) else "",
                 "✓" if signal.get('OBV增长', False) else "",
-                "✓" if signal.get('量价配合', False) else ""))
+                "✓" if signal.get('量价配合', False) else "",
+                signal.get('历史信号成功率', 0)
+            ))
         
-        print("-" * 120)
+        print("-" * 130)
+        print("注: ★★★ 表示趋势起点信号，此类股票更可能出现明显上涨")
+        print("    历史成功率表示类似信号在历史上后5天内上涨超过3%的概率")
 
 
 def main():
@@ -1040,10 +1314,16 @@ def main():
             print("最新价格: 无数据")
             
         print(f"综合评分: {result['综合评分']:.1f}")
+        
+        # 显示历史信号成功率
+        if "历史信号成功率" in result and result["历史信号成功率"] > 0:
+            print(f"历史信号成功率: {result['历史信号成功率']:.1f}%")
+        
         print(f"任一买入信号: {'是' if result['任一买入信号'] else '否'}")
         
         # 打印详细信号
         print("\n信号触发情况:")
+        print(f"趋势起点: {'是' if result.get('趋势起点', False) else '否'}")
         print(f"强势突破: {'是' if result['强势突破'] else '否'}")
         print(f"低吸回调: {'是' if result['低吸回调'] else '否'}")
         print(f"三线合一上涨: {'是' if result['三线合一上涨'] else '否'}")
@@ -1061,6 +1341,8 @@ def main():
                 if value is not None:
                     if name == "OBV":
                         print(f"{name}: {value:.0f}")
+                    elif name in ["涨幅20日", "成交量变化率"]:
+                        print(f"{name}: {value:.2f}%")
                     else:
                         print(f"{name}: {value:.2f}")
         
@@ -1068,10 +1350,17 @@ def main():
         if result["任一买入信号"]:
             print("\n详细信号指标:")
             for signal_type, details in result["信号详情"].items():
-                if result[signal_type]:
+                if result.get(signal_type, False) and details:  # 确保有详情数据
                     print(f"\n{signal_type}信号:")
                     for k, v in details.items():
-                        print(f"  {k}: {v}")
+                        if isinstance(v, (float, np.float64)) and abs(v) < 100:
+                            print(f"  {k}: {v:.4f}")
+                        else:
+                            print(f"  {k}: {v}")
+        
+        # 对于趋势起点信号的股票，给出特别提示
+        if result.get("趋势起点", False):
+            print("\n特别提示: 该股票显示趋势起点信号，可能即将启动上涨行情，建议进一步研究其基本面。")
                         
         # 询问是否保存为Excel
         save_excel = input("\n是否保存分析结果到Excel文件? (y/n): ").strip().lower()

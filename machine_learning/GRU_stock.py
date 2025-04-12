@@ -9,6 +9,8 @@ import akshare as ak
 import matplotlib.pyplot as plt
 import matplotlib as mpl
 from sklearn.metrics import mean_squared_error, mean_absolute_error
+import os
+import joblib
 
 # 字体文件路径（确保路径正确）
 font_path = "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc"
@@ -26,20 +28,59 @@ def load_stock_data(symbol):
     stock_df.sort_values('date', inplace=True)
     return stock_df
 
+
+def load_shanghai_index_data():
+    sh_index_df = ak.index_zh_a_hist(symbol='000001', period="daily")
+    sh_index_df = sh_index_df[['日期', '涨跌幅']]
+    sh_index_df.columns = ['date', 'shanghai_pct_change']
+    sh_index_df['date'] = pd.to_datetime(sh_index_df['date'])
+    return sh_index_df
+
+
+def load_financia_data(symbol):
+    financial_data = ak.stock_financial_analysis_indicator(symbol=symbol,start_year="2010")
+    print(financial_data.columns)
+    financial_data = financial_data[['日期', '总资产利润率(%)', '营业利润率(%)','资产报酬率(%)', '存货周转率(次)','流动比率','资产负债率(%)']]
+    # 将列名修改为英文
+    financial_data.columns = ['date', 'ROA', 'ROS', 'ROE', 'Inventory_turnover', 'Current_ratio', 'Debt_ratio']
+    financial_data['date'] = pd.to_datetime(financial_data['date'])
+    return financial_data
+
+
+def fill_financial_data(df):
+    # 对财务数据进行前向填充
+    df['ROA'].ffill(inplace=True)
+    df['ROS'].ffill(inplace=True)
+    df['ROE'].ffill(inplace=True)
+    df['Inventory_turnover'].ffill(inplace=True)
+    df['Current_ratio'].ffill(inplace=True)
+    df['Debt_ratio'].ffill(inplace=True)
+    return df
+
 # 获取沪深300所有股票数据并合并
 def load_hs300_data():
     hs300_stocks = ak.index_stock_cons('000300')['品种代码']
+    sh_index_df = load_shanghai_index_data()
     dfs = []
     for symbol in hs300_stocks:
         try:
             df = load_stock_data(symbol)
             df = add_technical_indicators(df)
+            # 合并上证指数数据
+            df = pd.merge(df, sh_index_df, on='date', how='left')
+            financial_data = load_financia_data(symbol)
+            # 合并财务数据
+            df = pd.merge(df, financial_data, on='date', how='left')
+            df = fill_financial_data(df)
             df['symbol'] = symbol
             print(f"加载股票{symbol}成功")
             dfs.append(df)
         except Exception as e:
             print(f"加载股票{symbol}失败: {e}")
     return pd.concat(dfs, ignore_index=True)
+
+
+
 
 # 自定义技术指标计算（不使用talib）
 def add_technical_indicators(df):
@@ -90,22 +131,49 @@ def build_model(input_shape):
 
 # 主程序
 if __name__ == '__main__':
+    symbol = '600026'
+    financial_data = load_financia_data(symbol)
+
+    input("uuuuuuuuuu")
+    # 创建保存模型的目录
+    model_dir = 'saved_models'
+    if not os.path.exists(model_dir):
+        os.makedirs(model_dir)
+
     hs300_df = load_hs300_data()
+
+    hs300_df.to_csv("hs300_data_finance.csv", index=False)
+
+    input("暂停在这里，按回车键继续...")
 
     look_back = 30
     X, y, scaler = preprocess_data(hs300_df, look_back)
 
     model = build_model((look_back, X.shape[2]))
 
-    model.fit(
+    # 训练模型
+    history = model.fit(
         X, y, epochs=50, batch_size=128,
         validation_split=0.1,
         callbacks=[EarlyStopping(patience=10, restore_best_weights=True)],
         verbose=1
     )
 
+    # 保存模型和相关参数
+    model.save(os.path.join(model_dir, 'best_model.h5'))
+    joblib.dump(scaler, os.path.join(model_dir, 'scaler.pkl'))
+    
+    # 保存模型参数
+    model_params = {
+        'look_back': look_back,
+        'features': ['open', 'high', 'low', 'close', 'volume', 'pct_change', 'turnover_rate', 'MACD', 'MACD_signal', 'RSI', 'SMA']
+    }
+    joblib.dump(model_params, os.path.join(model_dir, 'model_params.pkl'))
+    
+    print("模型和参数已保存到", model_dir, "目录")
+
     # 单独用601868验证
-    stock_df = load_stock_data("601868")
+    stock_df = load_stock_data("002630")
     stock_df = add_technical_indicators(stock_df)
     X_stock, y_stock, scaler_stock = preprocess_data(stock_df, look_back)
 
